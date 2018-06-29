@@ -15,3 +15,6 @@ where
 group by
     column1,
     column2
+ORDER BY
+    column1,
+    column2
