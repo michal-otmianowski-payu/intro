@@ -1,0 +1,1449 @@
+
+CREATE  PROCEDURE [dbo].[usp_ETL_Load_TRANSACTIONS_EXT]  @OKRES INT, @OKRES_TO INT = 0 AS
+
+SET NOCOUNT ON;
+
+declare @msg varchar(2047)
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': START'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+	--DECLARE @OKRES INT = 3, @OKRES_TO INT = 3
+	DECLARE @DATE DATETIME = DATEADD(DAY, 1, EOMONTH(GETDATE(), @OKRES * (-1)))
+	DECLARE @DATE50 DATETIME
+	SET @DATE50 = @DATE - CAST('00:50' AS DATETIME);
+	DECLARE @DATE_TO DATETIME
+	IF @OKRES_TO = 0
+		BEGIN
+	SET @DATE_TO = CAST(GETDATE() AS DATE)
+	END
+		ELSE
+		BEGIN
+	SET @DATE_TO = DATEADD(DAY, 0, EOMONTH(@DATE, @OKRES_TO - 1))
+	END
+
+DROP TABLE IF EXISTS #NBP
+select EffectiveDate, CurrencyCode, Rate
+INTO #NBP
+from [dbo].[V_ExchangeRates_NBP]
+where EffectiveDate >=   DATEADD(yy,-1,DATEADD(yy,DATEDIFF(yy,0,@DATE),0))
+create clustered index idx1_nbp on #NBP(EffectiveDate, CurrencyCode, Rate)
+
+DROP TABLE IF EXISTS #NBC
+select EffectiveDate, CurrencyCode, Rate, Amount
+INTO #NBC
+from [dbo].[V_ExchangeRates_NBC]
+where EffectiveDate >=   DATEADD(yy,-1,DATEADD(yy,DATEDIFF(yy,0,@DATE),0))
+create clustered index idx1_nbc on #NBC(EffectiveDate, CurrencyCode, Rate, Amount )
+
+drop TABLE if EXISTS #curpmf
+
+SELECT DISTINCT
+	dpmf.FIRM_BA_ORIGIN
+   ,dpmf.M_FIRM_ID
+   ,dpmf.FIRM_PARTNER_ID
+   ,dpp.ID_VER as trans_id_ver_PARTNER_program
+   ,dpp.StartDate
+   ,dpp.EndDate
+INTO #CURPMF
+FROM dbo.DIM_POS_MER_FIRM dpmf
+join DIM_PARTNER_PROGRAM dpp on dpmf.FIRM_PARTNER_ID = dpp.PARTNER_ID
+WHERE dpmf.IS_CURRENT = 1
+	AND dpmf.FIRM_PARTNER_ID > 0
+
+drop TABLE if EXISTS #pd
+
+select pd2.partner_id, PD2.trans_desc2_value, dpp.id_ver as trans_id_ver_PARTNER_program,dpp.StartDate ,dpp.EndDate
+INTO #pd
+FROM dbo.DICT_PP_DESC2 PD2
+JOIN DIM_PARTNER_PROGRAM dpp on pd2.PARTNER_ID = dpp.PARTNER_ID
+
+
+TRUNCATE TABLE dbo.TRANSACTIONS_EXT
+
+INSERT INTO dbo.TRANSACTIONS_EXT  WITH (TABLOCK)
+	SELECT
+		TR.TRANS_POS_ID
+	   ,(-1) * TPV_COMM.COMMISSION AS COMMISSION
+	   ,(-1) * TPV_COMM.COMMISSION_USD AS COMMISSION_USD
+	   ,(-1) * TPV_COMM.COMMISSION_ORIGIN AS COMMISSION_ORIGIN
+	   ,AF.ACT_FEE
+	   ,AF.ACT_FEE_USD
+	   ,TR.TRANS_GW_NAME
+	   ,0 AS COPS
+	   ,0 AS COPS_USD
+	   ,CASE
+			WHEN ISNULL(AF.ACT_FEE, 0) = 0
+			THEN TPV_COMM.TPV
+			ELSE 0
+		END AS TPV
+	   ,COALESCE(AF.FEE_ID_VER, DPMF.ID_VER, -1) AS TRANS_ID_VER_POS_MER_FIRM
+	   ,ISNULL(DCP.[ID_CARD_PAYMENT], -1) AS TRANS_ID_PC
+	   ,TR.TRANS_BANK_MERCHANT_ID
+	   ,ISNULL(BA.[BA_ID], -1) AS TRANS_BA_ID
+	   ,SUBSTRING(TV.CARD_PAN_MASKED, 1, 6) AS TRANS_CARD_NR_BIN
+	   ,ISNULL(C_XB.ID_COUNTRY, -1) AS TRANS_ID_COUNTRY
+	   ,TR.TRANS_GW_MERCHANT
+	   ,TR.TRANS_CHECKOUT_FLAG
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_FINISH_DATE, 112) AS INT) AS TRANS_ID_DATE_FINISH
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_CANCEL_DATE, 112) AS INT) AS TRANS_ID_DATE_CANCEL
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_RECV_DATE, 112) AS INT) AS TRANS_ID_DATE_RECV
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_SENT_DATE, 112) AS INT) AS TRANS_ID_DATE_SENT
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_AUTH_DATE, 112) AS INT) AS TRANS_ID_DATE_AUTH
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_INIT_DATE, 112) AS INT) AS TRANS_ID_DATE_INIT
+	   ,CAST(CONVERT(VARCHAR(20), TR.TRANS_CREATE_DATE, 112) AS INT) AS TRANS_ID_DATE_CREATE
+	   ,TR.TRANS_CREATE_DATE
+	   ,COALESCE(TGN.ID_TRANS_GW_NAME, TGN_D.ID_TRANS_GW_NAME, -1) AS TRANS_ID_TRANS_GW_NAME
+	   ,TR.TRANS_STATUS
+	   ,TR.TRANS_PAY_TYPE
+	   ,TR.TRANS_CURRENCY
+	   ,TR.TRANS_CLIENT_IP
+	   ,TR.TRANS_ORDER_ID
+	   ,TR.TRANS_AUTH_FRAUD_DESC
+	   ,TR.TRANS_AUTH_FRAUD
+	   ,TR.TRANS_AUTH_STATUS
+	   ,TR.TRANS_DESC
+	   ,TR.TRANS_AMOUNT
+	   ,'PL' + CAST(TR.TRANS_ID AS VARCHAR) AS TRANS_ID
+	   ,CASE
+			WHEN ISNULL(AF.ACT_FEE, 0) = 0
+			THEN TPV_COMM.TPV_USD
+			ELSE 0
+		END AS TPV_USD
+	   ,CASE
+			WHEN ISNULL(AF.ACT_FEE, 0) = 0
+			THEN TPV_COMM.TPV_ORIGIN
+			ELSE 0
+		END AS TPV_ORIGIN
+	   ,TR.TRANS_DESC2
+	   ,CASE
+			WHEN ISNULL(TPV_COMM.TPV, 0) = 0 OR
+				ISNULL(AF.ACT_FEE, 0) > 0
+			THEN 0
+			ELSE 1
+		END AS TPT
+	   ,TPV_COMM.[BILL_ID_DATE] AS TRANS_ID_BILLING_DATE
+	   ,TR.TRANS_CLT_EMAIL_HASH
+	   ,TR.TRANS_SHOP_ID
+	   ,TR.TRANS_SESSION_ID
+	   ,TPV_COMM.TRANS_CURRENCY_LOCAL
+	   ,ISNULL(DPB.ID_PRODUCT, -1) AS TRANS_ID_PRODUCT
+	   ,CAST(0 AS TINYINT) AS TestTransaction
+	    ,COALESCE(NULLIF(CPMF.trans_id_ver_PARTNER_program,''),pd2.trans_id_ver_PARTNER_program) as trans_id_ver_PARTNER_program
+		,COALESCE(CASE WHEN tr.trans_gw_name='pd'
+				THEN ((fxor.FXO_BASE_AMOUNT / 100 * fxrt.FXR_PROVIDER_RATE - (fxor.FXO_TERM_AMOUNT / 100))
+				* CASE WHEN COALESCE(DXB.NEW_ASSIGNMENT,XBPL.NEW_ASSIGNMENT,C.COUNTRY_CODE) = 'PL'
+							THEN ISNULL(NBP.Rate /1,CR_MCP.FX_VALUE_PLN)
+						WHEN COALESCE(DXB.NEW_ASSIGNMENT,XBPL.NEW_ASSIGNMENT,C.COUNTRY_CODE) = 'CZ'
+							THEN ISNULL(NBC.Rate /NBC.Amount,CR_MCP.FX_VALUE_CZK)
+						ELSE 0
+					END) * CASE
+								WHEN ISNULL(TPV_COMM.TPV, 0) = 0 OR
+									ISNULL(AF.ACT_FEE, 0) > 0
+								THEN 0
+								ELSE 1
+							END
+			 END, TPV_COMM.FX_REV) AS [FX_REV]
+		,COALESCE(CASE WHEN tr.trans_gw_name='pd'
+				THEN ((fxor.FXO_BASE_AMOUNT / 100 * fxrt.FXR_PROVIDER_RATE - (fxor.FXO_TERM_AMOUNT / 100)) * CR_MCP.FX_VALUE_USD)
+							* CASE
+								WHEN ISNULL(TPV_COMM.TPV, 0) = 0 OR
+									ISNULL(AF.ACT_FEE, 0) > 0
+								THEN 0
+								ELSE 1
+							END
+			END, TPV_COMM.FX_REV_USD) AS [FX_REV_USD]
+		, CASE WHEN MCP2.TMD_TRANS_ID IS NULL THEN 0 ELSE 1 END * CASE
+																WHEN ISNULL(TPV_COMM.TPV, 0) = 0 OR
+																	ISNULL(AF.ACT_FEE, 0) > 0
+																THEN 0
+																ELSE 1
+															END AS  [MCP_FLG]
+		, CASE WHEN PP_REN.REMUNERIATION >= 0 THEN PP_REN.REMUNERIATION ELSE 0 END AS [PARTNER_REM]
+		, CASE WHEN PP_REN.REMUNERIATION_USD  >= 0 THEN PP_REN.REMUNERIATION_USD  ELSE 0 END AS [PARTNER_REM_USD]
+	FROM Staging.PAYGW_DWH.IMP_PAYGW_TRANS AS TR
+	LEFT JOIN [dbo].[DIM_POS_MER_FIRM] AS DPMF ON TR.TRANS_POS_ID = DPMF.POS_ID
+			AND TR.TRANS_CREATE_DATE >= DPMF.[VALID_FROM]
+			AND CAST(TR.TRANS_CREATE_DATE AS DATE) <= DPMF.[VALID_TO]
+			AND DPMF.[SOURCE] = 'PAYGW'
+	LEFT JOIN [dbo].[DIM_BUSINESS_AREA] AS BA ON TR.TRANS_BA_ID = BA.BA_ID
+			AND BA.SOURCE_NAME = 'PAYGW'
+	LEFT JOIN [dbo].[DIM_COUNTRY] AS C ON C.COUNTRY_CODE = BA.BA_ORIGIN
+			AND C.SOURCE_CD = 'PAYGW'
+
+	------------------------------------
+	LEFT JOIN [dbo].[DICT_XB] AS DXB ON DXB.M_FIRM_ID = DPMF.M_FIRM_ID
+			AND (C.ID_COUNTRY = 17  OR c.COUNTRY_CODE <> DXB.NEW_ASSIGNMENT)
+	LEFT JOIN [dbo].[DICT_XB] AS XBPL ON C.ID_COUNTRY = 17
+			AND XBPL.M_FIRM_ID = 0
+	LEFT JOIN [dbo].[DIM_COUNTRY] AS C_XB ON COALESCE(DXB.NEW_ASSIGNMENT, XBPL.NEW_ASSIGNMENT, C.COUNTRY_CODE) = C_XB.COUNTRY_CODE
+			AND C_XB.SOURCE_CD = 'PAYGW'
+	-----------------------------------
+
+	LEFT JOIN Staging.PCARD_DWH.IMP_PC_TB_TRANSACTION_VIEW AS TV ON TR.TRANS_ID = TV.EXTERNAL_IDENTIFIER
+			AND TV.TS >= @DATE
+			AND CAST(TV.TS AS DATE) <= @DATE_TO
+			AND TV.[TYPE] = 'SET'
+			AND TV.ORIGIN_CODE IN ('PL', 'CZ', 'HU')
+
+	LEFT JOIN [dbo].[CARD_PAYMENT] AS CP ON CP.EXTERNAL_IDENTIFIER = TR.TRANS_ID
+	LEFT JOIN [dbo].[DIM_CARD_PAYMENT] AS DCP ON DCP.[CARD_SCHEME] = CP.[CARD_SCHEME]
+			AND DCP.[CARD_TYPE] = CP.[CARD_TYPE]
+			AND DCP.[CARD_CLASSIFICATION] = CP.[CARD_CLASSIFICATION]
+			AND DCP.[CARD_PROFILE] = CP.[CARD_PROFILE]
+			AND DCP.[INTRA_EU_RELATION] = CP.[INTRA_EU_RELATION]
+			AND DCP.[CARD_AUTH_3DS_TYPE] = CP.[CARD_AUTH_3DS_TYPE]
+			AND DCP.[CARD_AUTH_LEVEL] = CP.[CARD_AUTH_LEVEL]
+			AND DCP.[ECI] = CP.[ECI]
+
+	LEFT JOIN [dbo].[V_USER_ORDER] AS UO ON UO.PAYMENT_ID_INT = TR.TRANS_ID
+			AND UO.CREATED >= @DATE50
+			AND UO.CREATED_DATE <= @DATE_TO
+	LEFT JOIN [dbo].[DIM_TRANS_GW_NAME] AS TGN ON CAST(TR.TRANS_BANK_MERCHANT_ID AS CHAR) = TGN.SOURCE_KEY
+			AND TGN.FEE_GROUP = COALESCE(UO.FEE_GROUP, '-1') --(CASE WHEN UO.FEE_GROUP = '1' THEN '-1' WHEN UO.FEE_GROUP IS NULL THEN '-1' ELSE UO.FEE_GROUP END)
+			AND TGN.CARD_SCHEME = COALESCE(TV.CARD_SCHEME, 'OTHER')
+	LEFT JOIN [dbo].[DIM_TRANS_GW_NAME] AS TGN_D ON TR.trans_gw_name = TGN_D.SOURCE_KEY
+			AND TGN_D.FEE_GROUP = COALESCE(UO.FEE_GROUP, '-1') --(CASE WHEN UO.FEE_GROUP = '1' THEN '-1' WHEN UO.FEE_GROUP IS NULL THEN '-1' ELSE UO.FEE_GROUP END)
+			AND TGN_D.CARD_SCHEME = COALESCE(TV.CARD_SCHEME, 'OTHER')
+			AND tgn_d.source_name = 'PAYGW'
+
+	LEFT JOIN [dbo].TPV_AND_COMMISSION AS TPV_COMM ON TPV_COMM.TRANS_ID = TR.TRANS_ID
+	LEFT JOIN dbo.ACT_FEE AS AF ON AF.TRANS_ID = TR.TRANS_ID
+
+	LEFT JOIN [dbo].[PRODUCT_BASE] AS PB ON PB.TRANS_ID = TR.TRANS_ID
+	LEFT JOIN [dbo].[DIM_PRODUCT_BASE] AS DPB ON DPB.[MOTO] = PB.[MOTO]
+			AND DPB.[RECURRING] = PB.[RECURRING]
+			AND DPB.[MASTERPASS] = PB.[MASTERPASS]
+			AND DPB.[ANDROID_PAY] = PB.[ANDROID_PAY]
+			AND DPB.[MOBILE_SDK] = PB.[MOBILE_SDK]
+			AND DPB.[MASS_COLLECT] = PB.[MASS_COLLECT]
+			AND DPB.[STORED_STATUS] = PB.[STORED_STATUS]
+			AND DPB.[STORED_HUB_SOURCE] = PB.[STORED_HUB_SOURCE]
+	LEFT JOIN #CURPMF CPMF ON CPMF.FIRM_BA_ORIGIN=DPMF.FIRM_BA_ORIGIN AND CPMF.M_FIRM_ID=DPMF.M_FIRM_ID
+								AND TR.TRANS_CREATE_DATE BETWEEN CPMF.StartDate and CPMF.EndDate
+	LEFT JOIN #pd PD2 ON TR.TRANS_DESC2=PD2.TRANS_DESC2_VALUE AND (COALESCE(NULLIF(DPMF.FIRM_PARTNER_ID,''),PD2.PARTNER_ID) IS NOT NULL)
+								AND TR.TRANS_CREATE_DATE BETWEEN pd2.StartDate and pd2.EndDate
+	LEFT JOIN Staging.PAYGW_DWH.IMP_PAYGW_TRANS_MCP_DATA MCP2 ON TR.TRANS_ID = MCP2.TMD_TRANS_ID
+	LEFT JOIN [Staging].[CO_DWH].[IMP_MCP_FX_ORDER] fxor ON TRY_CONVERT(BIGINT,fxor.[FXO_EXT_ID]) = MCP2.TMD_TRANS_ID
+	LEFT JOIN [Staging].[CO_DWH].[IMP_MCP_FX_RATE] fxrt ON fxor.FXO_USED_RATE_ID = fxrt.FXR_ID
+    LEFT JOIN dbo.DICT_COGNOS_RATES CR_MCP ON CR_MCP.ID_DATE = CAST(CONVERT(VARCHAR(20), TR.TRANS_SENT_DATE, 112) AS INT)
+		AND CR_MCP.CURRENCY_VAL = fxrt.FXR_TERM_CURRENCY
+	LEFT JOIN #NBP AS NBP  ON NBP.EffectiveDate = CAST(TR.TRANS_FINISH_DATE AS DATE) AND NBP.CurrencyCode =  TR.TRANS_CURRENCY
+	LEFT JOIN #NBC AS NBC  ON NBC.EffectiveDate = CAST(TR.TRANS_FINISH_DATE AS DATE) AND NBC.CurrencyCode =  TR.TRANS_CURRENCY
+	LEFT JOIN PP_REMUNERATION PP_REN ON PP_REN.TRANS_ID = ('PL'+CAST(TR.TRANS_ID as VARCHAR(30)))
+	WHERE TR.TRANS_CREATE_DATE >= @DATE
+		AND TR.TRANS_CREATE_DATE < (@DATE_TO + 1)
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO TRANSACTIONS_EXT Single Platform'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+-------------------------------------------------------------------
+EXEC dbo.usp_Load_TRANSACTIONS_EXT_Gecad_Prep @OKRES
+											 ,@OKRES_TO
+-------------------------------------------------------------------
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO exec dbo.usp_Load_TRANSACTIONS_EXT_Gecad_Prep'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+DROP TABLE IF EXISTS #tmp_gecad_trx
+
+SELECT
+	T.COMPLETEDATE
+   ,T.AMOUNT
+   ,T.GROSSPROFIT
+   ,T.CURRENCY
+   ,T.PAYTYPE
+   ,T.ISPWA
+   ,T.TERMINALTYPE
+   ,T.IDACCOUNT
+   ,T.REFNO
+   ,T.TRANSACTIONTYPE
+   ,T.IdCard
+   ,DTS.trans_status
+   ,T.trans_creation_date
+   ,T.trans_notification_sent_date
+   ,T.trans_authorization
+   ,T.hash_number_mail
+   ,T.IP_NUMBER
+   ,T.TVACOMMISSION
+   ,T.TVAGROSSPROFIT
+   ,T.BANKSHORTNAME
+   ,T.APPROVALTYPE
+   ,R.[DATE]
+   ,R.FROMCURRENCY
+   ,R.TOCURRENCY
+   ,R.EXCHANGERATE
+   ,'TR' AS COUNTRY_CODE
+   ,'TR' AS SOURCE_NAME
+   ,'TRY' AS LOCAL_CURRENCY
+   ,CASE
+		WHEN (T.TerminalType = 'EXTERNAL' OR
+			T.PayType = 'SMS')
+		THEN ISNULL(T.GrossProfit, 0)
+		ELSE ISNULL(T.COMMISSION, 0)
+	END AS COMMISSION_ORIGIN
+   ,CASE
+		WHEN (T.TerminalType = 'EXTERNAL' OR
+			T.PayType = 'SMS')
+		THEN ISNULL(T.GrossProfit, 0)
+		ELSE ISNULL(T.COMMISSION, 0)
+	END AS COMMISSION
+   ,T.transaction_status
+   ,T.IdSale
+   ,T.TPV_ORIGIN
+   ,T.TPT
+   ,T.TestTransaction AS TestTransaction
+   , CAST (NULL as decimal(22,12)) AS MCP_REV_LCY
+INTO #tmp_gecad_trx
+FROM Staging.[MYSQL].[TR_TRANS_TMP] AS T
+LEFT JOIN Staging.MYSQL.IMP_PAY_TR_REP_EXCHANGE_RATES AS R ON R.FROMCURRENCY = T.CURRENCY
+		AND R.ToCurrency = 'TRY'
+		AND R.[DATE] = CAST(T.COMPLETEDATE AS DATE)
+LEFT JOIN Staging.MYSQL.TR_MERCHANTS AS M ON M.IDACCOUNT = T.IDACCOUNT
+LEFT JOIN [dbo].[DICT_TRANS_STATUS] DTS ON DTS.gecad_status = T.transaction_status
+WHERE 1=0
+
+CREATE CLUSTERED COLUMNSTORE INDEX  CCI_tmp_gecad_trx  ON  #tmp_gecad_trx;
+
+INSERT INTO #tmp_gecad_trx WITH (TABLOCK)
+SELECT
+	T.COMPLETEDATE
+   ,T.AMOUNT
+   ,T.GROSSPROFIT
+   ,T.CURRENCY
+   ,T.PAYTYPE
+   ,T.ISPWA
+   ,T.TERMINALTYPE
+   ,T.IDACCOUNT
+   ,T.REFNO
+   ,T.TRANSACTIONTYPE
+   ,T.IdCard
+   ,DTS.trans_status
+   ,T.trans_creation_date
+   ,T.trans_notification_sent_date
+   ,T.trans_authorization
+   ,T.hash_number_mail
+   ,T.IP_NUMBER
+   ,T.TVACOMMISSION
+   ,T.TVAGROSSPROFIT
+   ,T.BANKSHORTNAME
+   ,T.APPROVALTYPE
+   ,R.[DATE]
+   ,R.FROMCURRENCY
+   ,R.TOCURRENCY
+   ,R.EXCHANGERATE
+   ,'TR' AS COUNTRY_CODE
+   ,'TR' AS SOURCE_NAME
+   ,'TRY' AS LOCAL_CURRENCY
+   ,CASE
+		WHEN (T.TerminalType = 'EXTERNAL' OR
+			T.PayType = 'SMS')
+		THEN ISNULL(T.GrossProfit, 0)
+		ELSE ISNULL(T.COMMISSION, 0)
+	END AS COMMISSION_ORIGIN
+   ,CASE
+		WHEN (T.TerminalType = 'EXTERNAL' OR
+			T.PayType = 'SMS')
+		THEN ISNULL(T.GrossProfit, 0)
+		ELSE ISNULL(T.COMMISSION, 0)
+	END AS COMMISSION
+   ,T.transaction_status
+   ,T.IdSale
+   ,T.TPV_ORIGIN
+   ,T.TPT
+   ,T.TestTransaction AS TestTransaction
+   , CAST (NULL as decimal(22,12)) AS MCP_REV_LCY
+FROM Staging.[MYSQL].[TR_TRANS_TMP] AS T
+LEFT JOIN Staging.MYSQL.IMP_PAY_TR_REP_EXCHANGE_RATES AS R ON R.FROMCURRENCY = T.CURRENCY
+		AND R.ToCurrency = 'TRY'
+		AND R.[DATE] = CAST(T.COMPLETEDATE AS DATE)
+LEFT JOIN Staging.MYSQL.TR_MERCHANTS AS M ON M.IDACCOUNT = T.IDACCOUNT
+LEFT JOIN [dbo].[DICT_TRANS_STATUS] DTS ON DTS.gecad_status = T.transaction_status
+WHERE ISNULL(R.TOCURRENCY,'TRY') = 'TRY'
+	AND T.transaction_status NOT IN ('REFUND')
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO #tmp_gecad_trx TR'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+INSERT INTO #tmp_gecad_trx WITH (TABLOCK)
+	SELECT
+		T.COMPLETEDATE
+	   ,T.AMOUNT
+	   ,T.GROSSPROFIT
+	   ,T.CURRENCY
+	   ,T.PAYTYPE
+	   ,T.ISPWA
+	   ,T.TERMINALTYPE
+	   ,T.IDACCOUNT
+	   ,T.REFNO
+	   ,T.TRANSACTIONTYPE
+	   ,T.IdCard
+	   ,DTS.trans_status
+	   ,T.trans_creation_date
+	   ,T.trans_notification_sent_date
+	   ,T.trans_authorization
+	   ,T.hash_number_mail
+	   ,T.IP_NUMBER
+	   ,T.TVACOMMISSION
+	   ,T.TVAGROSSPROFIT
+	   ,T.BANKSHORTNAME
+	   ,T.APPROVALTYPE
+	   ,R.[DATE]
+	   ,R.FROMCURRENCY
+	   ,R.TOCURRENCY
+	   ,R.EXCHANGERATE
+	   ,'RU' AS COUNTRY_CODE
+	   ,'RU' AS SOURCE_NAME
+	   ,'RUB' AS LOCAL_CURRENCY
+	   ,CASE
+			WHEN (T.TERMINALTYPE = 'EXTERNAL' OR
+				T.PAYTYPE = 'SMS')
+			THEN ISNULL(T.GROSSPROFIT, 0)
+			ELSE ISNULL(T.COMMISSION, 0)
+		END AS COMMISSION_ORIGIN
+	   ,CASE
+			WHEN (T.TERMINALTYPE = 'EXTERNAL' OR
+				T.PAYTYPE = 'SMS')
+			THEN ISNULL(T.GROSSPROFIT, 0)
+			ELSE ISNULL(T.COMMISSION, 0)
+		END AS COMMISSION
+	   ,T.transaction_status
+	   ,T.IdSale
+	   ,T.TPV_ORIGIN
+	   ,T.TPT
+	   ,T.TestTransaction
+	   , CAST (NULL as decimal(22,12)) AS MCP_REV_LCY
+	FROM Staging.[MYSQL].[RU_TRANS_TMP] AS T
+	LEFT JOIN Staging.MYSQL.IMP_PAY_RU_REP_EXCHANGE_RATES AS R ON R.FROMCURRENCY = T.CURRENCY
+			AND R.ToCurrency = 'RUB'
+			AND R.[DATE] = CAST(T.COMPLETEDATE AS DATE)
+	LEFT JOIN Staging.MYSQL.RU_MERCHANTS AS M ON M.IDACCOUNT = T.IDACCOUNT
+	LEFT JOIN [dbo].[DICT_TRANS_STATUS] DTS ON DTS.gecad_status = T.transaction_status
+	WHERE ISNULL(R.TOCURRENCY,'RUB') = 'RUB'
+		AND T.transaction_status NOT IN ('REFUND')
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO #tmp_gecad_trx RU'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+INSERT INTO #tmp_gecad_trx WITH (TABLOCK)
+	SELECT
+		T.COMPLETEDATE
+	   ,T.AMOUNT
+	   ,T.GROSSPROFIT
+	   ,T.CURRENCY
+	   ,T.PAYTYPE
+	   ,T.ISPWA
+	   ,T.TERMINALTYPE
+	   ,T.IDACCOUNT
+	   ,T.REFNO
+	   ,T.TRANSACTIONTYPE
+	   ,T.IdCard
+	   ,DTS.trans_status
+	   ,T.trans_creation_date
+	   ,T.trans_notification_sent_date
+	   ,T.trans_authorization
+	   ,T.hash_number_mail
+	   ,T.IP_NUMBER
+	   ,T.TVACOMMISSION
+	   ,T.TVAGROSSPROFIT
+	   ,T.BANKSHORTNAME
+	   ,T.APPROVALTYPE
+	   ,R.[DATE]
+	   ,R.FROMCURRENCY
+	   ,R.TOCURRENCY
+	   ,R.EXCHANGERATE
+	   ,'RO' AS COUNTRY_CODE
+	   ,'RO' AS SOURCE_NAME
+	   ,'RON' AS LOCAL_CURRENCY
+	   ,CASE
+			WHEN (T.TERMINALTYPE = 'EXTERNAL' OR
+				T.PAYTYPE = 'SMS')
+			THEN ISNULL(T.GROSSPROFIT, 0)
+			ELSE ISNULL(T.COMMISSION, 0)
+		END AS COMMISSION_ORIGIN
+	   ,CASE
+			WHEN (T.TERMINALTYPE = 'EXTERNAL' OR
+				T.PAYTYPE = 'SMS')
+			THEN ISNULL(T.GROSSPROFIT, 0)
+			ELSE ISNULL(T.COMMISSION, 0)
+		END AS COMMISSION
+	   ,T.transaction_status
+	   ,T.IdSale
+	   ,T.TPV_ORIGIN
+	   ,T.TPT
+	   ,T.TestTransaction AS TestTransaction
+       , (fxor.FXO_BASE_AMOUNT / 100 * fxrt.FXR_PROVIDER_RATE - (fxor.FXO_TERM_AMOUNT / 100)) * rofx.ExchangeRate AS MCP_REV_LCY
+	FROM [Staging].[MYSQL].[RO_TRANS_TMP] AS T
+	LEFT JOIN Staging.MYSQL.IMP_PAY_RO_REP_EXCHANGE_RATES AS R ON R.FROMCURRENCY = T.CURRENCY
+			AND R.ToCurrency = 'RON'
+			AND R.[DATE] = CAST(T.COMPLETEDATE AS DATE)
+	LEFT JOIN Staging.MYSQL.RO_MERCHANTS AS M ON M.IDACCOUNT = T.IDACCOUNT
+	LEFT JOIN [dbo].[DICT_TRANS_STATUS] DTS ON DTS.gecad_status = T.transaction_status
+	LEFT JOIN [Staging].[CO_DWH].[IMP_MCP_FX_ORDER] fxor ON TRY_CONVERT(BIGINT,fxor.[FXO_EXT_ID]) = T.IdSale
+						and dts.trans_status=99
+						AND PAYTYPE + '-' + TERMINALTYPE NOT IN ('MARKETPLACE-INTERNAL')
+	LEFT JOIN [Staging].[CO_DWH].[IMP_MCP_FX_RATE] fxrt ON fxor.FXO_USED_RATE_ID = fxrt.FXR_ID
+	LEFT JOIN dbo.DICT_COGNOS_RATES co ON co.ID_DATE = CAST(CONVERT(VARCHAR(20), T.trans_notification_sent_date, 112) AS INT) AND co.CURRENCY_VAL = fxrt.FXR_TERM_CURRENCY
+	LEFT JOIN Staging.MYSQL.IMP_PAY_RO_REP_EXCHANGE_RATES AS rofx  ON rofx.FROMCURRENCY = fxrt.FXR_TERM_CURRENCY
+																	  AND rofx.ToCurrency = 'RON'
+																	  AND rofx.[DATE] = CAST(T.trans_creation_date AS DATE)
+	WHERE ISNULL(R.TOCURRENCY,'RON') = 'RON'
+		AND T.transaction_status NOT IN ('REFUND')
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO #tmp_gecad_trx RO'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+
+INSERT INTO [dbo].[TRANSACTIONS_EXT] WITH (TABLOCK)
+SELECT
+		TRANS_POS_ID
+	   ,COMMISSION
+	   ,COMMISSION_USD
+	   ,COMMISSION_ORIGIN
+	   ,ACT_FEE
+	   ,ACT_FEE_USD
+	   ,TRANS_GW_NAME
+	   ,COPS
+	   ,COPS_USD
+	   ,TPV
+	   ,COALESCE(T.TRANS_ID_VER_POS_MER_FIRM, -1) AS TRANS_ID_VER_POS_MER_FIRM
+	   ,TRANS_ID_PC
+	   ,TRANS_BANK_MERCHANT_ID
+	   ,TRANS_BA_ID
+	   ,TRANS_CARD_NR_BIN
+	   ,TRANS_ID_COUNTRY
+	   ,TRANS_GW_MERCHANT
+	   ,TRANS_CHECKOUT_FLAG
+	   ,TRANS_ID_DATE_FINISH
+	   ,TRANS_ID_DATE_CANCEL
+	   ,TRANS_ID_DATE_RECV
+	   ,TRANS_ID_DATE_SENT
+	   ,TRANS_ID_DATE_AUTH
+	   ,TRANS_ID_DATE_INIT
+	   ,TRANS_ID_DATE_CREATE
+	   ,TRANS_CREATE_DATE
+	   ,COALESCE(T.TRANS_ID_TRANS_GW_NAME,-1) AS TRANS_ID_TRANS_GW_NAME
+	   ,TRANS_STATUS
+	   ,TRANS_PAY_TYPE
+	   ,TRANS_CURRENCY
+	   ,TRANS_CLIENT_IP
+	   ,TRANS_ORDER_ID
+	   ,TRANS_AUTH_FRAUD_DESC
+	   ,TRANS_AUTH_FRAUD
+	   ,TRANS_AUTH_STATUS
+	   ,TRANS_DESC
+	   ,TRANS_AMOUNT
+	   ,TRANS_ID
+	   ,TPV_USD
+	   ,TPV_ORIGIN
+	   ,TRANS_DESC2
+	   ,TPT
+	   ,TRANS_ID_BILLING_DATE
+	   ,TRANS_CLT_EMAIL_HASH
+	   ,TRANS_SHOP_ID
+	   ,TRANS_SESSION_ID
+	   ,TRANS_CURRENCY_LOCAL
+	   ,TRANS_ID_PRODUCT
+	   ,TestTransaction
+	   ,NULL AS trans_id_ver_PARTNER_program
+	   , MCP_REV_LCY as [FX_REV]
+	   , MCP_REV_USD as [FX_REV_USD]
+	   , MCP_FLG as [MCP_FLG]
+	   , 0 as [PARTNER_REM]
+	   , 0 as [PARTNER_REM_USD]
+	FROM (SELECT -----------------------------GECAD---------------------------------
+			-IDACCOUNT AS TRANS_POS_ID
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) *
+			CASE
+				WHEN (TRANSACTIONTYPE = 'REGULAR' AND
+					transaction_status = 'COMPLETE' OR
+					(TRANSACTIONTYPE = 'REFUND' AND
+					GECAD_TRX.COUNTRY_CODE = 'TR')) AND
+					NOT (PAYTYPE = 'MARKETPLACE') AND
+					transaction_status = 'COMPLETE'
+				THEN ISNULL(ACPT.FEE, 0.00) + (COMMISSION - GECAD_TRX.TvaCommission) * ISNULL(EXCHANGERATE, CASE
+						WHEN GECAD_TRX.CURRENCY = 'EUR'
+						THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+						WHEN GECAD_TRX.CURRENCY = 'USD'
+						THEN 1 / COGNOS_RATES.FX_VALUE_USD
+						ELSE 1
+					END)
+				ELSE 0
+			END AS commission
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) *
+			CASE
+				WHEN (TRANSACTIONTYPE = 'REGULAR' AND
+					transaction_status = 'COMPLETE' OR
+					(TRANSACTIONTYPE = 'REFUND' AND
+					GECAD_TRX.COUNTRY_CODE = 'TR')) AND
+					NOT (PAYTYPE = 'MARKETPLACE') AND
+					transaction_status = 'COMPLETE'
+				THEN ISNULL(ACPT.FEE_USD, 0.00) + COGNOS_RATES.FX_VALUE_USD * COALESCE(EXCHANGERATE, CASE
+						WHEN GECAD_TRX.CURRENCY = 'EUR'
+						THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+						WHEN GECAD_TRX.CURRENCY = 'USD'
+						THEN 1 / COGNOS_RATES.FX_VALUE_USD
+						ELSE 1
+					END) * ISNULL(GECAD_TRX.COMMISSION - GECAD_TRX.TvaCommission, 0)
+				ELSE 0
+			END AS COMMISSION_USD
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) *
+			CASE
+				WHEN (TRANSACTIONTYPE = 'REGULAR' AND
+					transaction_status = 'COMPLETE' OR
+					(TRANSACTIONTYPE = 'REFUND' AND
+					GECAD_TRX.COUNTRY_CODE = 'TR')) AND
+					NOT (PAYTYPE = 'MARKETPLACE') AND
+					transaction_status = 'COMPLETE'
+				THEN ISNULL(ACPT.FEE, 0.00) + (commission_origin - GECAD_TRX.TvaCommission)
+				ELSE 0
+			END AS commission_origin
+		   ,0 ACT_FEE
+		   ,0 ACT_FEE_USD
+		   ,PAYTYPE + '-' + TERMINALTYPE AS [TRANS_GW_NAME]
+		   ,CASE
+				WHEN GECAD_TRX.TRANS_STATUS != 99
+				THEN 0.00
+				ELSE ~CAST(GECAD_TRX.TestTransaction AS BIT) *
+					CASE
+						WHEN NOT (TRANSACTIONTYPE = 'REFUND' AND
+							transaction_status = 'COMPLETE' AND
+							GECAD_TRX.COUNTRY_CODE = 'RO' AND
+							PAYTYPE = 'MARKETPLACE')
+						THEN CASE
+								WHEN (PAYTYPE = 'MARKETPLACE') OR
+									SERVICE_PROVIDER = 'TSP'
+								THEN 0
+								ELSE (ISNULL(COMMISSION, 0)) - (ISNULL(GROSSPROFIT, 0))
+							END * ISNULL(EXCHANGERATE, CASE
+								WHEN GECAD_TRX.CURRENCY = 'EUR'
+								THEN 1 / fx_value_eur
+								WHEN GECAD_TRX.CURRENCY = 'USD'
+								THEN 1 / fx_value_usd
+								ELSE 1
+							END)
+						ELSE 0
+					END + (ISNULL(DACR.RATE, 0.00) * (TPV_ORIGIN * ISNULL(EXCHANGERATE, CASE
+						WHEN GECAD_TRX.CURRENCY = 'EUR'
+						THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+						WHEN GECAD_TRX.CURRENCY = 'USD'
+						THEN 1 / COGNOS_RATES.FX_VALUE_USD
+						ELSE 1
+					END))
+					)
+			END AS COPS
+		   ,CASE
+				WHEN GECAD_TRX.TRANS_STATUS != 99
+				THEN 0.00
+				ELSE ~CAST(GECAD_TRX.TestTransaction AS BIT) *
+					CASE
+						WHEN NOT (TRANSACTIONTYPE = 'REFUND' AND
+							transaction_status = 'COMPLETE' AND
+							GECAD_TRX.COUNTRY_CODE = 'RO' AND
+							PAYTYPE = 'MARKETPLACE')
+						THEN CASE
+								WHEN (PAYTYPE = 'MARKETPLACE') OR
+									SERVICE_PROVIDER = 'TSP'
+								THEN 0
+								ELSE (ISNULL(COMMISSION, 0)) - (ISNULL(GROSSPROFIT, 0))
+							END * ISNULL(EXCHANGERATE, CASE
+								WHEN GECAD_TRX.CURRENCY = 'EUR'
+								THEN 1 / fx_value_eur
+								WHEN GECAD_TRX.CURRENCY = 'USD'
+								THEN 1 / fx_value_usd
+								ELSE 1
+							END)
+						ELSE 0
+					END * COGNOS_RATES.FX_VALUE_USD
+					+ (ISNULL(DACR.RATE, 0.00) * (COGNOS_RATES.FX_VALUE_USD * COALESCE(EXCHANGERATE, CASE
+						WHEN GECAD_TRX.CURRENCY = 'EUR'
+						THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+						WHEN GECAD_TRX.CURRENCY = 'USD'
+						THEN 1 / COGNOS_RATES.FX_VALUE_USD
+						ELSE 1
+					END) * GECAD_TRX.TPV_ORIGIN))
+			END AS COPS_USD
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) * TPV_ORIGIN * ISNULL(EXCHANGERATE, CASE
+				WHEN GECAD_TRX.CURRENCY = 'EUR'
+				THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+				WHEN GECAD_TRX.CURRENCY = 'USD'
+				THEN 1 / COGNOS_RATES.FX_VALUE_USD
+				ELSE 1
+			END) AS TPV
+		   ,ISNULL(DPMF.ID_VER,-1) AS TRANS_ID_VER_POS_MER_FIRM
+		   ,DCP.ID_CARD_PAYMENT AS [TRANS_ID_PC]
+		   ,NULL TRANS_BANK_MERCHANT_ID
+		   ,NULL TRANS_BA_ID
+		   ,'' TRANS_CARD_NR_BIN
+		   ,ISNULL(C.ID_COUNTRY, -1) AS TRANS_ID_COUNTRY
+		   ,'' TRANS_GW_MERCHANT
+		   ,0 AS TRANS_CHECKOUT_FLAG
+		   ,CAST(CONVERT(VARCHAR(20), COMPLETEDATE, 112) AS INT) AS TRANS_ID_DATE_FINISH
+		   ,NULL AS [TRANS_ID_DATE_CANCEL]
+		   ,CAST(CONVERT(VARCHAR(20), COMPLETEDATE, 112) AS INT) AS TRANS_ID_DATE_RECV
+		   ,CAST(CONVERT(VARCHAR(20), trans_notification_sent_date, 112) AS INT) AS [TRANS_ID_DATE_SENT]
+		   ,CAST(CONVERT(VARCHAR(20), trans_authorization, 112) AS INT) AS [TRANS_ID_DATE_AUTH]
+		   ,NULL AS [TRANS_ID_DATE_INIT]
+		   ,CAST(CONVERT(VARCHAR(20), trans_creation_date, 112) AS INT) AS TRANS_ID_DATE_CREATE
+		   ,trans_creation_date AS [TRANS_CREATE_DATE]
+		   ,CASE TestTransaction
+				WHEN 0
+				THEN ISNULL(TGN.ID_TRANS_GW_NAME, -1)
+				WHEN 1
+				THEN 1027
+				ELSE -1
+			END AS TRANS_ID_TRANS_GW_NAME
+		   ,GECAD_TRX.trans_status AS [TRANS_STATUS]
+		   ,PAYTYPE + '-' + TERMINALTYPE AS [TRANS_PAY_TYPE]
+		   ,GECAD_TRX.CURRENCY AS TRANS_CURRENCY
+		   ,IP_NUMBER AS [TRANS_CLIENT_IP]
+		   ,NULL AS [TRANS_ORDER_ID]
+		   ,NULL AS [TRANS_AUTH_FRAUD_DESC]
+		   ,NULL AS [TRANS_AUTH_FRAUD]
+		   ,NULL AS [TRANS_AUTH_STATUS]
+		   ,CAST(REFNO AS CHAR) AS TRANS_DESC
+		   ,AMOUNT AS TRANS_AMOUNT
+		   ,GECAD_TRX.COUNTRY_CODE + CAST(GECAD_TRX.IdSale AS VARCHAR(30)) AS TRANS_ID
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) * COGNOS_RATES.FX_VALUE_USD * COALESCE(EXCHANGERATE, CASE
+				WHEN GECAD_TRX.CURRENCY = 'EUR'
+				THEN 1 / COGNOS_RATES.FX_VALUE_EUR
+				WHEN GECAD_TRX.CURRENCY = 'USD'
+				THEN 1 / COGNOS_RATES.FX_VALUE_USD
+				ELSE 1
+			END) * GECAD_TRX.TPV_ORIGIN AS TPV_USD
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) * GECAD_TRX.TPV_ORIGIN AS TPV_ORIGIN
+		   ,NULL AS [TRANS_DESC2]
+		   ,~CAST(GECAD_TRX.TestTransaction AS BIT) * GECAD_TRX.TPT AS TPT
+		   ,CASE
+				WHEN transaction_status = 'COMPLETE'																																--zminana add orderstatus='complete'
+				THEN CAST(CONVERT(VARCHAR(20), COMPLETEDATE, 112) AS INT)
+				ELSE NULL
+			END AS [TRANS_ID_BILLING_DATE]
+		   ,hash_number_mail [TRANS_CLT_EMAIL_HASH]
+		   ,NULL AS TRANS_SHOP_ID
+		   ,NULL AS TRANS_SESSION_ID
+		   ,LOCAL_CURRENCY AS TRANS_CURRENCY_LOCAL
+		   ,-1 AS TRANS_ID_PRODUCT
+		   ,GECAD_TRX.TestTransaction
+		   ,GECAD_TRX.MCP_REV_LCY
+		   ,GECAD_TRX.MCP_REV_LCY * COGNOS_RATES.FX_VALUE_USD as [MCP_REV_USD]
+		   , CASE WHEN GECAD_TRX.MCP_REV_LCY IS NULL THEN 0 ELSE 1 END as MCP_FLG
+		FROM #tmp_gecad_trx AS GECAD_TRX
+		LEFT JOIN [dbo].[DIM_COUNTRY] AS C
+			ON C.COUNTRY_CODE = GECAD_TRX.COUNTRY_CODE
+			AND C.SOURCE_CD IN ( 'RO' ,'RU','TR')
+		LEFT JOIN [dbo].[DIM_TRANS_GW_NAME] AS TGN
+			ON GECAD_TRX.PAYTYPE + '-' + GECAD_TRX.TERMINALTYPE = TGN.SOURCE_KEY
+			AND GECAD_TRX.SOURCE_NAME = TGN.SOURCE_NAME
+
+		LEFT JOIN [dbo].[DIM_POS_MER_FIRM] AS DPMF
+			ON -GECAD_TRX.IDACCOUNT = DPMF.POS_ID
+			AND COALESCE(GECAD_TRX.trans_creation_date, GECAD_TRX.COMPLETEDATE) >= DPMF.[VALID_FROM]
+			AND CAST(COALESCE(GECAD_TRX.trans_creation_date, GECAD_TRX.COMPLETEDATE) AS DATE) <= DPMF.[VALID_TO]
+			AND GECAD_TRX.COUNTRY_CODE = DPMF.FIRM_COUNTRY
+			AND DPMF.[SOURCE] IN ( 'GECAD','OTHER','RO','RU','TR')
+			AND DPMF.[FIRM_STATUS] = '1' --BIAZURE-332
+
+		LEFT JOIN [dbo].[DICT_COGNOS_RATES] AS COGNOS_RATES
+			ON COGNOS_RATES.CURRENCY_VAL = LOCAL_CURRENCY
+			AND COGNOS_RATES.ID_DATE = CAST(CONVERT(VARCHAR(20), GECAD_TRX.CompleteDate, 112) AS INT)
+			AND COGNOS_RATES.FX_TYPE = 'FX02'
+		LEFT JOIN [dbo].v_GECAD_CARD_DETAILS CD
+			ON cd.IdCard = GECAD_TRX.IdCard
+			AND GECAD_TRX.COUNTRY_CODE = cd.COUNTRY
+		LEFT JOIN [dbo].[DIM_CARD_PAYMENT] AS DCP
+			ON DCP.[CARD_SCHEME] = CD.CardSchemeShort
+			AND DCP.[CARD_TYPE] = CD.CardTypeCode
+			AND DCP.[CARD_CLASSIFICATION] = Cd.cardclassification
+			AND DCP.[CARD_PROFILE] = cd.cardprofile
+			AND DCP.[INTRA_EU_RELATION] = '-1'
+			AND DCP.[CARD_AUTH_3DS_TYPE] = 'N/A'
+			AND DCP.[CARD_AUTH_LEVEL] = 'N/A'
+			AND DCP.[ECI] = '-1'
+		LEFT JOIN [dbo].[DICT_ADDITIONAL_COPS_RATE] DACR
+			ON DACR.M_FIRM_ID = DPMF.M_FIRM_ID
+			AND DACR.FIRM_BA_ORIGIN = DPMF.FIRM_BA_ORIGIN
+			AND
+			CASE
+				WHEN GECAD_TRX.transaction_status = 'COMPLETE'																																--zminana add orderstatus='complete'
+				THEN CAST(CONVERT(VARCHAR(10), COMPLETEDATE, 121) AS DATE)
+				ELSE NULL
+			END BETWEEN DACR.DATE_FROM AND DACR.DATE_TO
+		LEFT JOIN [dbo].[ADDITIONAL_COMMISIONS_PER_TRX] ACPT
+			ON ACPT.TRANS_ID = (GECAD_TRX.COUNTRY_CODE + CAST(GECAD_TRX.IdSale AS VARCHAR(30)))) AS T
+
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO TRANSACTIONS_EXT GECAD'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+-----------------------------------
+--------AFRICA
+-----------------------------------
+
+DECLARE @Failed int  = 0;
+SELECT
+	@Failed = COUNT(*)
+FROM dbo.TaskModelWaitFor
+WHERE TRANS_ID_COUNTRY = 24
+
+IF @Failed = 0
+BEGIN
+
+DROP TABLE IF EXISTS #payba
+
+select  pay.id as payload_id
+		, pay.storeId
+		, pay.payloadStatus
+		, pay.payUReference
+		, pay.lastUpdated
+		, pay.receivedTime
+		, pay.merchantReference
+		, pay.customer_id
+		, pay.transactionType
+		, payba.id
+		, CASE WHEN pay.transactionType = 'BIL_PAYMENT'
+				THEN pay.transactionamount
+				ELSE payba.amount
+		 END / 100.0 AS amount
+		, pay.responseTime
+		, CASE ISNULL(payba.currency,'')
+		WHEN 'SOUTH_AFRICAN_RAND'
+			THEN 'ZAR'
+		WHEN 'NIGERIAN_NAIRA'
+			THEN 'NGN'
+		WHEN 'UNITED_STATES_DOLLAR'
+			THEN 'USD'
+		WHEN 'THAI_BAHT'
+			THEN 'THB'
+		WHEN 'INDIAN_RUPEE'
+			THEN 'INR'
+		WHEN 'EURO'
+			THEN 'EUR'
+		WHEN 'KENYAN_SHILLING'
+			THEN 'KES'
+		WHEN 'NAMIBIAN_DOLLAR'
+			THEN 'NAD'
+		WHEN 'SINGAPORE_DOLLAR'
+			THEN 'SGD'
+		WHEN 'CEDI'
+			THEN 'GHS'
+		WHEN 'NEW_TAIWAN_DOLLAR'
+			THEN 'TWD'
+		ELSE ISNULL(payba.currency,'')
+		END as currency
+		,CASE WHEN CASE ISNULL(payba.currency,'')
+								WHEN 'SOUTH_AFRICAN_RAND'
+									THEN 'ZAR'
+								WHEN 'NIGERIAN_NAIRA'
+									THEN 'NGN'
+								WHEN 'UNITED_STATES_DOLLAR'
+									THEN 'USD'
+								WHEN 'THAI_BAHT'
+									THEN 'THB'
+								WHEN 'INDIAN_RUPEE'
+									THEN 'INR'
+								WHEN 'EURO'
+									THEN 'EUR'
+								WHEN 'KENYAN_SHILLING'
+									THEN 'KES'
+								WHEN 'NAMIBIAN_DOLLAR'
+									THEN 'NAD'
+								WHEN 'SINGAPORE_DOLLAR'
+									THEN 'SGD'
+								WHEN 'CEDI'
+									THEN 'GHS'
+								WHEN 'NEW_TAIWAN_DOLLAR'
+									THEN 'TWD'
+								ELSE ISNULL(payba.currency,'')
+								END = CASE
+										WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+											THEN 'ZAR'
+										WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+											THEN 'NGN'
+										ELSE payba.currency
+									END
+			THEN CASE WHEN pay.transactionType = 'BIL_PAYMENT'
+				THEN pay.transactionamount
+				ELSE payba.amount
+				END   / 100.0
+		ELSE CASE WHEN pay.transactionType = 'BIL_PAYMENT'
+				THEN pay.transactionamount
+				ELSE payba.amount
+		 END / 100.0 *  (1 / nbp.FX_VALUE_USD)
+		END AS TPV
+		,CASE WHEN CASE ISNULL(payba.currency,'')
+								WHEN 'SOUTH_AFRICAN_RAND'
+									THEN 'ZAR'
+								WHEN 'NIGERIAN_NAIRA'
+									THEN 'NGN'
+								WHEN 'UNITED_STATES_DOLLAR'
+									THEN 'USD'
+								WHEN 'THAI_BAHT'
+									THEN 'THB'
+								WHEN 'INDIAN_RUPEE'
+									THEN 'INR'
+								WHEN 'EURO'
+									THEN 'EUR'
+								WHEN 'KENYAN_SHILLING'
+									THEN 'KES'
+								WHEN 'NAMIBIAN_DOLLAR'
+									THEN 'NAD'
+								WHEN 'SINGAPORE_DOLLAR'
+									THEN 'SGD'
+								WHEN 'CEDI'
+									THEN 'GHS'
+								WHEN 'NEW_TAIWAN_DOLLAR'
+									THEN 'TWD'
+								ELSE ISNULL(payba.currency,'')
+								END = CASE
+										WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+											THEN 'ZAR'
+										WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+											THEN 'NGN'
+										ELSE payba.currency
+								END
+			THEN CASE WHEN pay.transactionType = 'BIL_PAYMENT'
+				THEN pay.transactionamount
+				ELSE payba.amount
+		 END   / 100.0
+		ELSE CASE WHEN pay.transactionType = 'BIL_PAYMENT'
+				THEN pay.transactionamount
+				ELSE payba.amount
+		 END  / 100.0 *  (1 / nbp.FX_VALUE_USD)
+		END * nbp.FX_VALUE_USD AS TPV_USD
+INTO #payba
+from Staging.MGL_SA.IMP_SA_PAYLOAD AS pay
+LEFT JOIN Staging.MGL_SA.IMP_SA_PAYLOAD_BASKET  AS payba ON pay.basket_id = payba.id
+left join [dbo].[SA_DICT_SHOP_MODEL] sdsm on pay.storeid=sdsm.store_id
+LEFT JOIN [dbo].[DICT_COGNOS_RATES] nbp ON nbp.FX_TYPE = 'FX02' AND NBP.CURRENCY_VAL = CASE	WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+																										THEN 'ZAR'
+																									WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+																										THEN 'NGN'
+																									ELSE payba.currency
+																								END
+																		and CAST(CONVERT(varchar(8),pay.lastUpdated,112) AS INT) = nbp.ID_DATE
+where payba.lastUpdated >= @DATE
+	and payba.currency = 'SOUTH_AFRICAN_RAND' /* wykluczenie Nigerii po walucie!!!! mail do Marcina z 26.02 i od Tomka */
+
+
+DELETE FROM #payba
+where tpv >= 2147000000
+
+
+DROP TABLE IF EXISTS #paypaymi
+
+CREATE TABLE #paypaymi
+([id] bigint
+  ,[payload_id] bigint
+  ,[paymentmethodtype] nvarchar(30)
+  ,[classification] nvarchar(50)
+  ,[transactionType] nvarchar(30)
+  , INDEX CCI_paypaymi CLUSTERED COLUMNSTORE)
+
+;WITH Q
+AS
+(SELECT
+		paypaymi.[id]
+	   ,paypaymi.[payload_id]
+	   ,paypaymi.[paymentmethodtype]
+	   ,paypaymi.[classification]
+	   ,paypaymi.[transactionType]
+	   ,ROW_NUMBER() OVER (PARTITION BY payload_id ORDER BY id DESC) AS Rn
+	FROM Staging.MGL_SA.IMP_SA_PAYLOAD_PAYMENT_METHOD_INSTANCE paypaymi
+	WHERE 1 = 1
+	AND paypaymi.tenderType = 'TENDERABLE'
+	AND paypaymi.pl_lastUpdated >= @DATE)
+INSERT INTO #paypaymi WITH (TABLOCK)
+SELECT
+		Q.[id]
+	   ,Q.[payload_id]
+	   ,Q.[paymentmethodtype]
+	   ,Q.[classification]
+	   ,Q.[transactionType]FROM Q
+WHERE Q.Rn = 1
+
+PRINT 'Po #paypaymi'
+
+DROP TABLE IF EXISTS #loyaltypl
+
+SELECT
+	p.id AS payload_id
+INTO #loyaltypl
+FROM [Staging].[MGL_SA].[IMP_SA_PAYLOAD] p
+JOIN [Staging].[MGL_SA].[IMP_SA_PAYLOAD_PAYMENT_METHOD_INSTANCE] pmi ON p.id = pmi.payload_id
+WHERE pmi.paymentMethodType IN ('DISCOVERYMILES', 'CREDITCARD')
+	AND pmi.tenderType = 'TENDERABLE'
+	AND p.payloadStatus IN ('SUCCESSFUL', 'LATE_PAYMENT', 'OVER_PAYMENT')
+GROUP BY p.id
+HAVING COUNT(DISTINCT pmi.paymentMethodType) > 1
+
+PRINT 'Po ##loyaltypl'
+
+--DROP TABLE IF EXISTS dbo.tmp_TRANSACTIONS_EXT_MGL
+
+DROP TABLE IF EXISTS #BINS_MGL
+
+select p1.basket_id, pmv.value AS CC_NUMBER_MASK
+INTO #BINS_MGL
+from [Staging].[MGL_SA].[IMP_SA_PAYLOAD] p1
+join [Staging].[MGL_SA].[IMP_SA_PAYLOAD] p on p1.parentPayloadId=p.id
+join [Staging].[MGL_SA].[IMP_SA_PAYLOAD_PAYMENT_METHOD_INSTANCE] pmi on  p.id = pmi.payload_id
+join [Staging].[MGL_SA].[IMP_SA_PAYLOAD_PAYMENT_METHOD_VALUES] pmv on pmi.id=pmv.payloadpaymentmethodinstance_id
+where pmv.field='CREDIT_CARD_CARD_NUMBER_MASK'
+	and p1.lastUpdated >= @DATE
+	AND ISNUMERIC(LEFT(pmv.value,6)) = 1
+       and LEFT(pmv.value,6) not LIKE '% %'
+       and LEFT(pmv.value,6) not LIKE '%  %'
+       and LEFT(pmv.value,6) not LIKE '%	%'
+       and LEFT(pmv.value,6) not LIKE '%.%'
+GROUP BY p1.basket_id, pmv.value
+
+
+----MAGELLAN
+
+INSERT INTO dbo.TRANSACTIONS_EXT
+SELECT
+	cast(payba.storeId as INT) * (-1) AS TRANS_POS_ID
+   , COALESCE(sdpl.tpt + payba.TPV  * sdpl.TPV_rate,
+   ( CASE WHEN ( payba.TPV * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END) >
+												CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END
+												AND CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END > -1
+				  THEN  ( payba.TPV * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END)
+				  ELSE CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END END  + (CASE
+												WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+												THEN 1
+												ELSE 0
+											END) * NG_COMM.TPT_COMM), --NG 	Taxify, The Bridge Clinic
+			( CASE WHEN ( payba.TPV * NG_COMM.TPV_COMM ) > NG_COMM.CAP AND NG_COMM.CAP > -1
+				  THEN  ( payba.TPV * NG_COMM.TPV_COMM )
+				  ELSE  NG_COMM.CAP END + (CASE
+											WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+													THEN 1
+													ELSE 0
+												END) * NG_COMM.TPT_COMM), --NG
+			0.00 )  AS COMMISSION
+   ,COALESCE((sdpl.tpt +  payba.TPV  * sdpl.TPV_rate),
+   ( CASE WHEN (payba.amount * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END) >
+												CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END
+												AND CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END > -1
+				  THEN  ( payba.TPV * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END)
+				  ELSE CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END END  + (CASE
+												WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+												THEN 1
+												ELSE 0
+											END) * NG_COMM.TPT_COMM), --NG 	Taxify, The Bridge Clinic
+			( CASE WHEN ( payba.TPV * NG_COMM.TPV_COMM ) > NG_COMM.CAP AND NG_COMM.CAP > -1
+				  THEN  ( payba.TPV * NG_COMM.TPV_COMM )
+				  ELSE  NG_COMM.CAP END  + (CASE
+												WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+												THEN 1
+												ELSE 0
+											END) * NG_COMM.TPT_COMM), --NG
+			  0.00) * nbp.FX_VALUE_USD AS COMMISSION_USD
+   ,COALESCE( (sdpl.tpt + payba.amount  * sdpl.TPV_rate) ,
+			( CASE WHEN (payba.amount * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END) >
+												CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END
+												AND CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END > -1
+				  THEN  (payba.amount * CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.TPV_COMM ELSE NG_COMM2.TPV_COM_INT END)
+				  ELSE CASE WHEN isnull(sb.country,'NG') = 'NG' THEN  NG_COMM2.CAP ELSE NG_COMM2.TPV_COM_INT_CAP END END  + (CASE
+												WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+												THEN 1
+												ELSE 0
+											END) * NG_COMM.TPT_COMM), --NG 	Taxify, The Bridge Clinic
+				( CASE WHEN (payba.amount * NG_COMM.TPV_COMM ) > NG_COMM.CAP AND NG_COMM.CAP > -1
+				  THEN  (payba.amount * NG_COMM.TPV_COMM )
+				  ELSE  NG_COMM.CAP END  + (CASE
+												WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+												THEN 1
+												ELSE 0
+											END) * NG_COMM.TPT_COMM), --NG
+			0.00 ) AS COMMISSION_ORIGIN
+   ,NULL AS ACT_FEE
+   ,NULL AS ACT_FEE_USD
+   , ISNULL(sdpm.Category,'Unknown') + '-' + case sdsm.Business_Model
+								WHEN 'PSP'
+										THEN  'INTERNAL'
+								WHEN 'TSP' Then 'EXTERNAL'
+								ELSE 'Unknown' END as TRANS_GW_NAME
+   , 0.00 as COPS
+   , 0.00 AS COPS_USD
+   , payba.TPV AS TPV
+   ,isnull(dpmf.ID_VER,-1) AS TRANS_ID_VER_POS_MER_FIRM
+   ,isnull(dcp.ID_CARD_PAYMENT,-1) AS TRANS_ID_PC
+   ,NULL AS TRANS_BANK_MERCHANT_ID
+   ,NULL AS TRANS_BA_ID
+   ,LEFT(COALESCE(bmgl.CC_NUMBER_MASK, paypaymv.[CREDIT_CARD_CARD_NUMBER_MASK]),6) AS TRANS_CARD_NR_BIN
+   ,CASE
+		WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+			THEN 24
+		WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+			THEN 25
+		WHEN payba.currency = 'ZAR'
+			THEN 24
+		WHEN payba.currency = 'NGN'
+			THEN 25
+		ELSE -1
+	END AS TRANS_ID_COUNTRY
+   ,NULL AS TRANS_GW_MERCHANT
+   ,NULL AS TRANS_CHECKOUT_FLAG
+   ,CAST(CONVERT(VARCHAR(8),payba.lastUpdated,112) AS INT) AS TRANS_ID_DATE_FINISH
+   ,CAST(CONVERT(VARCHAR(8),payba.lastUpdated,112)  AS INT)AS TRANS_ID_DATE_CANCEL
+   ,CAST(CONVERT(VARCHAR(8),payba.lastUpdated,112) AS INT) AS TRANS_ID_DATE_RECV
+   ,NULL AS TRANS_ID_DATE_SENT
+   ,NULL AS TRANS_ID_DATE_AUTH
+   ,NULL AS TRANS_ID_DATE_INIT
+   ,CAST(CONVERT(VARCHAR(8),payba.receivedtime,112)  AS INT) AS TRANS_ID_DATE_CREATE
+   ,payba.receivedtime AS TRANS_CREATE_DATE
+   ,isnull(dtgwn.ID_TRANS_GW_NAME,-1) AS TRANS_ID_TRANS_GW_NAME
+   ,CASE WHEN payba.payloadstatus = 'SUCCESSFUL' THEN 99 ELSE -1 END AS TRANS_STATUS
+   ,NULL AS TRANS_PAY_TYPE
+   ,payba.currency as TRANS_CURRENCY
+   ,paycufie.value AS TRANS_CLIENT_IP
+   ,NULL AS TRANS_ORDER_ID
+   ,NULL AS TRANS_AUTH_FRAUD_DESC
+   ,NULL AS TRANS_AUTH_FRAUD
+   ,NULL AS TRANS_AUTH_STATUS
+   ,NULL AS TRANS_DESC
+   ,payba.amount AS TRANS_AMOUNT
+   , ('MG'+CAST(payba.id  as VARCHAR(30))) AS TRANS_ID
+   , payba.TPV_USD
+   , payba.amount  AS TPV_ORIGIN
+   , payba.payUReference AS TRANS_DESC2
+   ,CASE
+		WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+		THEN 1
+		ELSE 0
+	END AS TPT
+   ,CASE
+		WHEN payba.payloadstatus IN ('SUCCESSFUL', 'OVER_PAYMENT', 'PARTIAL_PAYMENT')
+		THEN CAST(CONVERT(VARCHAR(8),payba.lastupdated,112) as INT)
+		ELSE NULL
+	END AS TRANS_ID_BILLING_DATE
+   ,paycu.email AS TRANS_CLT_EMAIL_HASH
+   ,NULL AS TRANS_SHOP_ID
+   ,NULL AS TRANS_SESSION_ID
+   ,CASE
+		WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+			THEN 'ZAR'
+		WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+			THEN 'NGN'
+		ELSE payba.currency
+	END AS TRANS_CURRENCY_LOCAL
+   ,NULL AS TRANS_ID_PRODUCT
+   , 0 as TESTTRANSACTION
+   , -1 AS PARTNER_ID
+   , CAST(NULL as DECIMAL(22,12)) as FX_REV
+	, CAST(NULL as DECIMAL(22,12)) as FX_REV_USD
+	, 0 as MCP_FLG
+	, CAST(NULL as DECIMAL(22,12)) as PARTNER_REM
+	, CAST(NULL as DECIMAL(22,12)) as PARTNER_REM_USD
+
+FROM #payba AS payba
+LEFT JOIN Staging.MGL_SA.IMP_SA_PAYLOAD_CUSTOMER AS paycu ON payba.customer_id = paycu.id
+LEFT JOIN Staging.MGL_SA.IMP_SA_PAYLOAD_CUSTOM_FIELD AS paycufie ON paycufie.payload_id = payba.payload_id
+		AND paycufie.customField = 'CUSTOMER_IP'
+LEFT JOIN  #paypaymi AS paypaymi ON paypaymi.payload_id = payba.payload_id
+LEFT JOIN Staging.MGL_SA.PVT_SA_PAYLOAD_PAYMENT_METHOD_VALUES AS paypaymv ON paypaymv.payloadPaymentMethodInstance_id = paypaymi.id
+LEFT JOIN [dbo].[DIM_POS_MER_FIRM] AS DPMF ON ((-1)*cast( payba.storeId as bigint)) = DPMF.POS_ID
+		AND payba.receivedTime >= DPMF.[VALID_FROM]
+		AND CAST(payba.receivedTime AS DATE) <= DPMF.[VALID_TO]
+		AND DPMF.[SOURCE] = 'MAGELLAN'
+left join [dbo].[SA_DICT_SHOP_MODEL] sdsm on payba.storeid=sdsm.store_id
+left join [dbo].[SA_DICT_PAYMENT_METHOD] sdpm on isnull(sdpm.[paymentmethodtype],'-1')=isnull(paypaymi.[paymentmethodtype],'-1')
+      and isnull(sdpm.[classification],'-1')=isnull(paypaymi.[classification],'-1')
+      and isnull(sdpm.[transactionType],'-1')=isnull(paypaymi.[transactionType],'-1')
+
+LEFT JOIN [dbo].[SA_DICT_PRICELIST] AS SDPL ON payba.storeId = sdpl.Store_ID
+	  and SDPL.[Payment_method_category]=sdpm.category
+	  and payba.receivedTime between SDPL.Date_from and SDPL.Date_to
+LEFT JOIN dbo.DIM_TRANS_GW_NAME dtgwn  ON (sdpm.Category + ' - ' + case sdsm.Business_Model
+																			WHEN 'PSP' THEN  'INTERNAL'
+																			WHEN 'TSP' Then 'EXTERNAL'
+																			ELSE 'Unknown' END) = dtgwn.SOURCE_KEY AND dtgwn.SOURCE_NAME='SA'
+
+LEFT JOIN [dbo].[SA_DICT_COPS_UNIFIED] AS sdcu ON sdcu.payment_method_category=sdpm.category
+									and sdsm.Business_Model=sdcu.[Business Model]
+									and payba.receivedTime between sdcu.Date_from and sdcu.Date_to
+LEFT JOIN [dbo].[DICT_COGNOS_RATES] nbp ON nbp.FX_TYPE = 'FX02' AND NBP.CURRENCY_VAL = CASE	WHEN ISNULL(sdsm.FIRM_BA_ORIGIN, '-1') = 'ZA'
+																										THEN 'ZAR'
+																									WHEN ISNULL (sdsm.FIRM_BA_ORIGIN, '-1') = 'NG'
+																										THEN 'NGN'
+																									ELSE payba.currency
+																								END
+																		and CAST(CONVERT(varchar(8),payba.lastUpdated,112) AS INT) = nbp.ID_DATE
+LEFT JOIN #loyaltypl lpl ON lpl.payload_id = payba.payload_id
+LEFT JOIN #BINS_MGL bmgl on bmgl.basket_id = payba.id
+LEFT JOIN [dbo].[CARD_PAYMENT] CP ON LEFT(COALESCE(bmgl.CC_NUMBER_MASK, paypaymv.CREDIT_CARD_CARD_NUMBER_MASK),6) = CAST(CP.EXTERNAL_IDENTIFIER as VARCHAR(30))
+LEFT JOIN [dbo].DIM_CARD_PAYMENT dcp ON 1=1
+			AND DCP.[CARD_SCHEME] = CP.[CARD_SCHEME]
+			AND DCP.[CARD_TYPE] = CP.[CARD_TYPE]
+			AND DCP.[CARD_CLASSIFICATION] = CP.[CARD_CLASSIFICATION]
+			AND DCP.[CARD_PROFILE] = CP.[CARD_PROFILE]
+			AND DCP.[INTRA_EU_RELATION] = CP.[INTRA_EU_RELATION]
+			AND DCP.[CARD_AUTH_3DS_TYPE] = CP.[CARD_AUTH_3DS_TYPE]
+			AND DCP.[CARD_AUTH_LEVEL] = CP.[CARD_AUTH_LEVEL]
+			AND DCP.[ECI] = CP.[ECI]
+LEFT JOIN [Staging].[MGL_SA].[IMP_SA_BININFO] sb on LEFT(COALESCE(bmgl.CC_NUMBER_MASK, paypaymv.CREDIT_CARD_CARD_NUMBER_MASK),6)=sb.binnumber
+ LEFT JOIN dbo.DICT_TRANS_STATUS_MAGELLAN dtsmgl on dtsmgl.PAYLOADSTATUS = payba.payloadStatus and dtsmgl.TRANSACTIONTYPE = payba.transactionType
+ LEFT JOIN dbo.DICT_NG_COMMISSION_TABLE AS NG_COMM ON payba.storeId = NG_COMM.STORE_ID
+										AND payba.lastUpdated between NG_COMM.DATE_FROM AND NG_COMM.DATE_TO
+										AND payba.merchantReference LIKE NG_COMM.MERCH_REF_LIKE
+ LEFT JOIN dbo.DICT_NG_COMMISSION_TABLE AS NG_COMM2 ON payba.storeId = NG_COMM2.STORE_ID
+										AND payba.lastUpdated between NG_COMM2.DATE_FROM AND NG_COMM2.DATE_TO
+										AND payba.merchantReference LIKE NG_COMM2.MERCH_REF_LIKE
+										AND NG_COMM2.TPV_COM_INT > 0 --The Bridge Clinic (203867), Taxify (204248)
+
+where 1=1
+	AND (payba.payloadStatus IN ('SUCCESSFUL', 'LATE_PAYMENT', 'OVER_PAYMENT')
+		OR (paypaymi.paymentmethodtype = 'EFT'
+			AND payba.payloadStatus = 'EXPIRED'
+			AND payba.responseTime IS NOT NULL))
+	AND (payba.transactionType IN ('FINALIZE','PAYMENT','BILL_PAYMENT','ONCE_OFF_PAYMENT_AND_DEBIT_ORDER'))
+	AND NOT (lpl.payload_id IS NOT NULL AND paypaymi.paymentmethodtype = 'CREDITCARD')
+	AND paypaymi.paymentmethodtype NOT IN ( 'LOYALTY' )
+	AND payba.lastUpdated  >= @DATE
+	AND payba.lastUpdated  < (@DATE_TO + 1)
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO TRANSACTIONS_EXT MAGELLAN'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+
+------------------
+-----RT
+------------------
+
+INSERT INTO  dbo.TRANSACTIONS_EXT
+SELECT
+	(-1) * tr.rtMerchantId AS TRANS_POS_ID
+	, (tr.amount/100)*PL.tpv_rate  as COMMISSION
+	, (tr.amount/100)*PL.tpv_rate * nbp.FX_VALUE_USD AS COMMISSION_USD
+	, (tr.amount/100)*PL.tpv_rate as COMMISSION_ORIGIN
+	, NULL as ACT_FEE
+	, null as ACT_FEE_USD
+	,'RT_CARD-' + 'EXTERNAL' as TRANS_GW_NAME
+	, 0.00	as COPS
+	, 0.00 as COPS_USD
+	, CASE WHEN tr.errorCode='00' and tr.transactioncode!='refunds' THEN tr.amount/100.0 ELSE 0 END AS TPV
+    , COALESCE(dpmf.ID_VER,-1) AS TRANS_ID_VER_POS_MER_FIRM
+	, COALESCE(dcp.ID_CARD_PAYMENT,-1) as TRANS_ID_PC	--mapped using bin range tables	based on  coalesce([MGL_SA].[IMP_SA_ANONYMOUSCARD].mask, [MGL_SA].[IMP_SA_PAYMENTMETHOD].mask)
+	, NULL as TRANS_BANK_MERCHANT_ID
+	, 1 TRANS_BA_ID	--based on SALESFORCE data
+	, (left(coalesce(ac.mask, pm.mask),6)) as TRANS_CARD_NR_BIN
+	, 24 as TRANS_ID_COUNTRY		--no info from Marcin
+	, ISNULL(dtgwn.ID_TRANS_GW_NAME, -1) AS TRANS_GW_MERCHANT
+	, NULL AS TRANS_CHECKOUT_FLAG
+	, CAST(CONVERT(varchar(8), b.processDate, 112) as INT ) AS  TRANS_ID_DATE_FINISH
+	, CAST(CONVERT(varchar(8), b.processDate, 112) as INT ) AS TRANS_ID_DATE_CANCEL
+	, CAST(CONVERT(varchar(8), b.processDate, 112) as INT ) AS TRANS_ID_DATE_RECV
+	, NULL AS TRANS_ID_DATE_SENT
+	, NULL AS TRANS_ID_DATE_AUTH
+	, NULL AS TRANS_ID_DATE_INIT
+	, CAST(CONVERT(varchar(8), b.processDate, 112) as INT ) AS  TRANS_ID_DATE_CREATE
+	, b.processDate as TRANS_CREATE_DATE
+	, COALESCE(dtgwn.ID_TRANS_GW_NAME,-1) as TRANS_ID_TRANS_GW_NAME
+	, CASE WHEN tr.errorCode = 'Successful' THEN 99 ELSE 2 END AS TRANS_STATUS --tr.errorDescription
+	, NULL as TRANS_PAY_TYPE
+	, 'ZAR' AS TRANS_CURRENCY
+	, NULL AS TRANS_CLIENT_IP
+	, NULL AS TRANS_ORDER_ID
+	, NULL AS TRANS_AUTH_FRAUD_DESC
+	, NULL AS TRANS_AUTH_FRAUD
+	, NULL AS TRANS_AUTH_STATUS
+	, NULL AS TRANS_DESC
+	, tr.amount/100.0 AS  TRANS_AMOUNT
+	, 'RT' + cast(tr.id as varchar(30)) AS TRANS_ID
+	, CASE WHEN tr.errorCode='00' and tr.transactioncode!='refunds' THEN (tr.amount/100.0)*nbp.FX_VALUE_USD ELSE 0 END as TPV_USD
+	, CASE WHEN tr.errorCode='00' and tr.transactioncode!='refunds' THEN (tr.amount/100.0) ELSE 0 END AS TPV_ORIGIN
+	, NULL AS TRANS_DESC2
+	, CASE WHEN tr.errorCode='00' and tr.transactioncode!='refunds' THEN 1 ELSE 0 END as TPT
+	, CAST(CONVERT(varchar(8), b.processDate, 112) as INT ) AS TRANS_ID_BILLING_DATE
+	, NULL AS TRANS_CLT_EMAIL_HASH
+	, NULL AS TRANS_SHOP_ID
+	, NULL AS TRANS_SESSION_ID
+	, 'ZAR' AS TRANS_CURRENCY_LOCAL --	Based on BA
+	, NULL as TRANS_ID_PRODUCT
+	, 0 as TESTTRANSACTION
+	, -1 as PARTNER_ID
+	, CAST(NULL as DECIMAL(22,12)) as FX_REV
+	, CAST(NULL as DECIMAL(22,12)) as FX_REV_USD
+	, 0 as MCP_FLG
+	, CAST(NULL as DECIMAL(22,12)) as PARTNER_REM
+	, CAST(NULL as DECIMAL(22,12)) as PARTNER_REM_USD
+  FROM [Staging].[MGL_SA].[IMP_SA_RT_TRANSACTIONS] tr
+  INNER JOIN  [Staging].[MGL_SA].[IMP_SA_RT_BATCHCONTROL] b on tr.rtbatchcontrolid=b.id
+  LEFT JOIN  [Staging].[MGL_SA].[IMP_SA_RT_PAYMENTMETHOD] p on tr.rtpaymentmethodid=p.id
+  LEFT JOIN  [Staging].[MGL_SA].[IMP_SA_ANONYMOUSCARD] ac on p.anonymousCardId=ac.id
+  LEFT JOIN  [Staging].[MGL_SA].[IMP_SA_PAYMENTMETHOD] pm on p.paymentMethodId=pm.id
+  LEFT JOIN  [Staging].[MGL_SA].[IMP_SA_MERCHANT] m on tr.rtmerchantid=m.storeid
+  LEFT JOIN [dbo].[DICT_COGNOS_RATES] nbp ON nbp.FX_TYPE = 'FX02'
+														AND NBP.CURRENCY_VAL = 'ZAR'
+														AND CONVERT(varchar(8),b.processdate,112) = nbp.ID_DATE
+  LEFT JOIN [dbo].[DIM_POS_MER_FIRM] AS DPMF ON ((-1)*cast( tr.rtMerchantId as bigint)) = DPMF.POS_ID
+			AND b.processDate >= DPMF.[VALID_FROM]
+			AND CAST(b.processDate AS DATE) <= DPMF.[VALID_TO]
+			AND DPMF.[SOURCE] = 'MAGELLAN'
+  LEFT JOIN [dbo].[SA_DICT_PRICELIST] pl on tr.rtmerchantid=pl.Store_ID and b.processDate>=PL.Date_from and b.processDate<=PL.date_to and pl.[PAYMENT_METHOD_CATEGORY]='RT_CARD-EXTERNAL'
+  LEFT JOIN [dbo].[DIM_TRANS_GW_NAME] dtgwn  ON dtgwn.SOURCE_KEY = 'RT_CARD-EXTERNAL' AND dtgwn.SOURCE_NAME='SA'
+  LEFT JOIN [dbo].[CARD_PAYMENT] CP ON (left(coalesce(ac.mask, pm.mask),6)) = CAST(CP.EXTERNAL_IDENTIFIER as VARCHAR(30))
+  LEFT JOIN [dbo].DIM_CARD_PAYMENT dcp ON 1=1
+			AND DCP.[CARD_SCHEME] = CP.[CARD_SCHEME]
+			AND DCP.[CARD_TYPE] = CP.[CARD_TYPE]
+			AND DCP.[CARD_CLASSIFICATION] = CP.[CARD_CLASSIFICATION]
+			AND DCP.[CARD_PROFILE] = CP.[CARD_PROFILE]
+			AND DCP.[INTRA_EU_RELATION] = CP.[INTRA_EU_RELATION]
+			AND DCP.[CARD_AUTH_3DS_TYPE] = CP.[CARD_AUTH_3DS_TYPE]
+			AND DCP.[CARD_AUTH_LEVEL] = CP.[CARD_AUTH_LEVEL]
+			AND DCP.[ECI] = CP.[ECI]
+ where 1=1
+	AND b.processDate  >= @DATE
+	AND b.processDate  < (@DATE_TO + 1)
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO TRANSACTIONS_EXT RT'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+
+
+----------------------
+-----SAFESHOP
+----------------------
+
+DROP TABLE IF EXISTS #SSTRANS
+
+SELECT
+	orderNumber AS trans_desc
+   ,ordernumber AS first_order_number
+   , OrderNumber AS last_order_number
+   , orderstatus as transactiontype
+   ,OrderAmount / 100.0 AS OrderAmount
+   ,Currency as currencycode
+   ,CC_CardNumber AS CC_CardNumber
+   ,LEFT(REPLACE(CC_CardNumber, '-', ''), 6) AS CC_CardBIN
+   ,StoreID
+   ,transactionreceived AS create_date
+   ,COALESCE(transactioncompleted,transactionreceived)  AS trans_finish_date
+   ,null AS trans_cancel_date
+   ,COALESCE(transactioncompleted,transactionreceived) AS trans_recv_date
+INTO #SSTRANS
+FROM Staging.MGL_SA.IMP_SA_SAFESHOP_TRANS
+WHERE TransactionReceived >= @DATE
+	AND TransactionReceived < (@DATE_TO + 1)
+
+
+INSERT INTO dbo.TRANSACTIONS_EXT
+	SELECT
+		(-1) * sstr.StoreID AS TRANS_POS_ID
+	   ,(SDPL.TPT + CASE WHEN sstr.CurrencyCode = CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1' END
+				THEN sstr.OrderAmount
+				ELSE sstr.OrderAmount *  (1 / nbp.FX_VALUE_USD)
+				END  * SDPL.tpv_rate)
+			AS COMMISSION
+	   ,(SDPL.TPT + CASE WHEN sstr.CurrencyCode = CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1'END
+				THEN sstr.OrderAmount
+				ELSE sstr.OrderAmount *  (1 / nbp.FX_VALUE_USD)
+				END  * SDPL.tpv_rate) * nbp.FX_VALUE_USD
+			AS COMMISSION_USD
+	   ,(SDPL.TPT + sstr.OrderAmount * SDPL.tpv_rate)  AS COMMISSION_ORIGIN
+	   ,NULL AS ACT_FEE
+	   ,NULL AS ACT_FEE_USD
+	   ,'Creditcard-' +
+		CASE sdsm.Business_Model
+			WHEN 'PSP'
+			THEN 'INTERNAL'
+			WHEN 'TSP'
+			THEN 'EXTERNAL'
+			ELSE 'Unknown'
+		END AS TRANS_GW_NAME
+	   ,0.00 AS COPS
+	   ,0.00 AS COPS_USD
+	   ,CASE WHEN sstr.CurrencyCode = CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1' END
+				THEN sstr.OrderAmount
+				ELSE sstr.OrderAmount *  (1 / nbp.FX_VALUE_USD)
+				END
+			AS TPV
+	   ,isnull(dpmf.ID_VER, -1) AS TRANS_ID_VER_POS_MER_FIRM
+	   ,isnull(dcp.ID_CARD_PAYMENT, -1) AS TRANS_ID_PC
+	   ,NULL AS TRANS_BANK_MERCHANT_ID
+	   ,-1 AS TRANS_BA_ID
+	   ,sstr.CC_CardBIN AS TRANS_CARD_NR_BIN
+	   ,CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 24 WHEN 'NG' THEN 25 ELSE -1 END AS TRANS_ID_COUNTRY
+	   ,NULL AS TRANS_GW_MERCHANT
+	   ,NULL AS TRANS_CHECKOUT_FLAG
+	   ,CAST(CONVERT(VARCHAR(8), sstr.trans_finish_date, 112) AS INT) AS TRANS_ID_DATE_FINISH
+	   ,CAST(CONVERT(VARCHAR(8), sstr.trans_cancel_date, 112) AS INT) AS TRANS_ID_DATE_CANCEL
+	   ,CAST(CONVERT(VARCHAR(8), sstr.trans_recv_date, 112) AS INT) AS TRANS_ID_DATE_RECV
+	   ,NULL AS TRANS_ID_DATE_SENT
+	   ,NULL AS TRANS_ID_DATE_AUTH
+	   ,NULL AS TRANS_ID_DATE_INIT
+	   ,CAST(CONVERT(VARCHAR(8), sstr.create_date, 112) AS INT) AS TRANS_ID_DATE_CREATE
+	   ,sstr.create_date AS TRANS_CREATE_DATE
+	   ,coalesce(dtgwn.id_trans_gw_name,-1) AS TRANS_ID_TRANS_GW_NAME -- MT dodane 2018-06-01, wczesniej był NULL
+	   ,dst_ss.ID_TRANS_STATUS AS TRANS_STATUS
+	   ,NULL AS TRANS_PAY_TYPE
+	   ,sstr.CurrencyCode AS TRANS_CURRENCY
+	   ,NULL as TRANS_CLIENT_IP
+	   ,NULL AS TRANS_ORDER_ID
+	   ,NULL AS TRANS_AUTH_FRAUD_DESC
+	   ,NULL AS TRANS_AUTH_FRAUD
+	   ,NULL AS TRANS_AUTH_STATUS
+	   ,NULL AS TRANS_DESC
+	   ,sstr.OrderAmount AS TRANS_AMOUNT
+	   ,'SS'+CAST(sstr.first_order_number AS NVARCHAR(30)) AS TRANS_ID
+	   , CASE WHEN sstr.CurrencyCode = CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1' END
+				THEN sstr.OrderAmount
+				ELSE sstr.OrderAmount *  (1 / nbp.FX_VALUE_USD)
+				END * nbp.FX_VALUE_USD
+			AS TPV_USD
+	   ,sstr.OrderAmount AS TPV_ORIGIN
+	   ,NULL AS TRANS_DESC2
+	   ,1 AS TPT
+	   ,CAST(CONVERT(VARCHAR(8), sstr.trans_recv_date, 112) AS INT) AS TRANS_ID_BILLING_DATE
+	   ,NULL AS TRANS_CLT_EMAIL_HASH
+	   ,NULL AS TRANS_SHOP_ID
+	   ,NULL AS TRANS_SESSION_ID
+	   ,CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1' END AS TRANS_CURRENCY_LOCAL
+	   ,NULL AS TRANS_ID_PRODUCT
+	   , 0 as TESTTRANSACTION
+	   ,NULL AS PARTNER_ID
+	   ,CAST(NULL as DECIMAL(22,12)) as FX_REV
+	   ,CAST(NULL as DECIMAL(22,12)) as FX_REV_USD
+	   ,0 as MCP_FLG
+	   ,CAST(NULL as DECIMAL(22,12)) as PARTNER_REM
+	   ,CAST(NULL as DECIMAL(22,12)) as PARTNER_REM_USD
+	FROM #SSTRANS sstr
+	LEFT JOIN [dbo].[SA_DICT_SHOP_MODEL] sdsm ON sstr.storeid = sdsm.store_id
+	LEFT JOIN [dbo].[SA_DICT_PRICELIST] AS SDPL ON sstr.storeId = sdpl.Store_ID
+			AND SDPL.[Payment_method_category] = 'Creditcard'
+			AND sstr.trans_recv_date BETWEEN SDPL.Date_from AND SDPL.Date_to
+	LEFT JOIN dbo.DIM_TRANS_GW_NAME dtgwn ON ('Creditcard - ' +
+			CASE sdsm.Business_Model
+				WHEN 'PSP'
+				THEN 'INTERNAL'
+				WHEN 'TSP'
+				THEN 'EXTERNAL'
+				ELSE 'Unknown'
+			END) = dtgwn.SOURCE_KEY
+			AND dtgwn.SOURCE_NAME = 'SA'
+	LEFT JOIN [dbo].[DICT_COGNOS_RATES] nbp ON nbp.FX_TYPE = 'FX02'
+			AND NBP.CURRENCY_VAL = CASE sdsm.firm_ba_origin WHEN 'ZA' THEN 'ZAR' WHEN 'NG' THEN 'NGN' ELSE '-1' END
+			AND CAST(CONVERT(VARCHAR(8), sstr.create_date, 112) AS INT) = nbp.ID_DATE
+	LEFT JOIN [dbo].[DIM_POS_MER_FIRM] AS DPMF ON ((-1) * CAST(sstr.storeId AS BIGINT)) = DPMF.POS_ID
+			AND sstr.create_date >= DPMF.[VALID_FROM]
+			AND CAST(sstr.create_date AS DATE) <= DPMF.[VALID_TO]
+			AND DPMF.[SOURCE] IN ('SAFESHOP', 'MAGELLAN')
+	LEFT JOIN [dbo].[CARD_PAYMENT] CP ON sstr.CC_CardBIN = CAST(CP.EXTERNAL_IDENTIFIER AS VARCHAR(30))
+	LEFT JOIN [dbo].DIM_CARD_PAYMENT dcp ON 1 = 1
+			AND DCP.[CARD_SCHEME] = CP.[CARD_SCHEME]
+			AND DCP.[CARD_TYPE] = CP.[CARD_TYPE]
+			AND DCP.[CARD_CLASSIFICATION] = CP.[CARD_CLASSIFICATION]
+			AND DCP.[CARD_PROFILE] = CP.[CARD_PROFILE]
+			AND DCP.[INTRA_EU_RELATION] = CP.[INTRA_EU_RELATION]
+			AND DCP.[CARD_AUTH_3DS_TYPE] = CP.[CARD_AUTH_3DS_TYPE]
+			AND DCP.[CARD_AUTH_LEVEL] = CP.[CARD_AUTH_LEVEL]
+			AND DCP.[ECI] = CP.[ECI]
+	LEFT JOIN dbo.DICT_TRANS_STATUS_SAFESHOP dst_ss ON dst_ss.TRANSACTIONTYPE = sstr.TRANSACTIONTYPE
+
+SET @msg = CONVERT(VARCHAR(19), GETDATE(), 121) + ': PO INSERT INTO TRANSACTIONS_EXT SAFESHOP'
+EXEC [ETL_ADM].[dbo].[ns_log_nowait] @msg
+
+
+END
+go
+

@@ -1,5 +1,5 @@
 SELECT 
-    column1
+    column23
     ,column2
     ,SUM(column3)
 FROM
